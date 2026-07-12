@@ -1,0 +1,9 @@
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/Calculator.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/edit_cache.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/rebuild_cache.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/list_install_components.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/install.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/install/local.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/install/strip.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/Calculator_autogen_timestamp_deps.dir
+/home/tuxium/QtCreator/Calculator/build/Release/CMakeFiles/Calculator_autogen.dir

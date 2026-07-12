@@ -1,0 +1,10 @@
+# ninja log v7
+2	211	1783842356767862129	Calculator_autogen/timestamp	de107932693843b3
+2	211	1783842356767862129	Calculator_autogen/mocs_compilation.cpp	de107932693843b3
+2	211	1783842356767862129	/home/tuxium/QtCreator/Calculator/build/Release/Calculator_autogen/timestamp	de107932693843b3
+2	211	1783842356767862129	/home/tuxium/QtCreator/Calculator/build/Release/Calculator_autogen/mocs_compilation.cpp	de107932693843b3
+213	934	1783842356777862129	CMakeFiles/Calculator.dir/ast.cpp.o	2154cdc1c1307126
+212	1313	1783842356776862129	CMakeFiles/Calculator.dir/Calculator_autogen/mocs_compilation.cpp.o	79d5f855004a11
+212	1315	1783842356776862129	CMakeFiles/Calculator.dir/main.cpp.o	7cd1806136d4e836
+213	1686	1783842356777862129	CMakeFiles/Calculator.dir/widget.cpp.o	ef600d8debe6df0
+1686	1734	1783842358250862032	Calculator	c05de3c5b9e7d075
