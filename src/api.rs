@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use axum::routing::{Router, delete, get, post, put};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use tracing::error;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 pub fn route() -> Router<AppState> {
@@ -79,6 +79,7 @@ impl FromRequestParts<AppState> for Claims {
         let state = state.clone();
 
         let token_uuid = token_uuid.ok_or_else(|| {
+            warn!("缺少认证令牌");
             (
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
@@ -95,7 +96,7 @@ impl FromRequestParts<AppState> for Claims {
             .exec(&mut db)
             .await
             .map_err(|e| {
-                error!("{e}");
+                error!("令牌查询失败: {e}");
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(ErrorResponse {
@@ -105,6 +106,7 @@ impl FromRequestParts<AppState> for Claims {
                 )
             })?
             .ok_or_else(|| {
+                warn!("令牌不存在");
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(ErrorResponse {
@@ -116,6 +118,7 @@ impl FromRequestParts<AppState> for Claims {
 
         let now = jiff::Timestamp::now();
         if token_record.expired_date < now {
+            warn!("令牌已过期");
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(ErrorResponse {
@@ -146,7 +149,7 @@ impl FromRequestParts<AppState> for Claims {
             .exec(&mut db)
             .await
             .map_err(|e| {
-                error!("{e}");
+                error!("用户查询失败: {e}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(ErrorResponse {
@@ -156,6 +159,7 @@ impl FromRequestParts<AppState> for Claims {
                 )
             })?
             .ok_or_else(|| {
+                warn!("令牌关联用户不存在");
                 (
                     StatusCode::UNAUTHORIZED,
                     Json(ErrorResponse {
@@ -165,6 +169,10 @@ impl FromRequestParts<AppState> for Claims {
                 )
             })?;
 
+        debug!(
+            "认证成功: user_id={}, permission={}",
+            user.id, user.permission
+        );
         Ok(Claims {
             user_id: user.id,
             permission: user.permission,
@@ -283,6 +291,10 @@ fn parse_date(s: &str) -> Result<jiff::Timestamp, &'static str> {
         .map(|d| d.to_datetime(jiff::civil::Time::midnight()))
         .and_then(|dt| dt.to_zoned(jiff::tz::TimeZone::UTC))
         .map(|z| z.timestamp())
+        .map(|ts| {
+            debug!("日期解析: \"{}\" -> {}", s, format_date(&ts));
+            ts
+        })
         .map_err(|_| "日期格式错误，应为 YYYY-MM-DD")
 }
 
@@ -309,7 +321,7 @@ async fn load_book_categories(book_id: usize, db: &mut toasty::Db) -> Result<Vec
     let book_cats = BookCategory::filter_by_book_id(&book_id)
         .exec(db)
         .await
-        .map_err(|e| error!("{e}"))?;
+        .map_err(|e| error!("加载书籍分类失败: {e}"))?;
     let mut categories = Vec::new();
     for bc in &book_cats {
         if let Ok(Some(cat)) = Category::filter_by_id(&bc.category_id)
@@ -329,7 +341,7 @@ async fn book_to_info(book: &Book, db: &mut toasty::Db) -> Result<BookInfo, ()> 
         let records = Record::filter_by_book_id(&book.id)
             .exec(db)
             .await
-            .map_err(|e| error!("{e}"))?;
+            .map_err(|e| error!("查询书籍借阅记录失败: {e}"))?;
         let active = records.iter().find(|r| r.return_date.is_none());
         match active {
             Some(r) => (true, Some(format_date(&r.expire_date))),
@@ -363,7 +375,7 @@ async fn count_user_borrows(user_id: usize, db: &mut toasty::Db) -> Result<usize
     let records = Record::filter_by_user_id(&user_id)
         .exec(db)
         .await
-        .map_err(|e| error!("{e}"))?;
+        .map_err(|e| error!("统计借阅数量失败: {e}"))?;
     Ok(records.iter().filter(|r| r.return_date.is_none()).count())
 }
 
@@ -389,13 +401,16 @@ async fn register(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
 ) -> impl IntoResponse {
+    debug!("注册请求: username={}", body.username);
     if !validate_username(&body.username) {
+        warn!("用户名格式错误: {}", body.username);
         return to_error(
             StatusCode::BAD_REQUEST,
             "用户名格式错误： 长度应为 3 至 32 位，且只包含字母、数字和下划线",
         );
     }
     if !validate_password(&body.password) {
+        warn!("密码格式错误");
         return to_error(
             StatusCode::BAD_REQUEST,
             "密码格式错误： 长度应为 8 至 64 位，且必须包含字母和数字",
@@ -409,13 +424,15 @@ async fn register(
     {
         Ok(c) => c,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return to_error(StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误");
         }
     };
     if count > 0 {
+        warn!("用户名已存在: {}", body.username);
         return to_error(StatusCode::CONFLICT, "用户名已存在");
     }
+    let username = body.username.clone();
     let argon2 = Argon2::default();
     let salt = SaltString::generate(&mut OsRng);
     let hashed_password = argon2
@@ -433,9 +450,10 @@ async fn register(
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("创建用户失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "创建用户失败");
     }
+    info!("用户注册成功: {}", username);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -452,6 +470,7 @@ struct LoginRequest {
 }
 
 async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> impl IntoResponse {
+    debug!("登录请求: username={}", body.username);
     let mut db = state.db.db().clone();
     let user = match User::filter_by_username(&body.username)
         .first()
@@ -460,6 +479,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     {
         Ok(Some(u)) => u,
         _ => {
+            warn!("登录失败: 用户名 {} 不存在", body.username);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(LoginResponse {
@@ -474,7 +494,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
     let parsed_hash = match PasswordHash::new(&user.password) {
         Ok(h) => h,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(LoginResponse {
@@ -490,6 +510,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         .verify_password(body.password.as_bytes(), &parsed_hash)
         .is_err()
     {
+        warn!("登录失败: 用户名 {} 密码错误", body.username);
         return (
             StatusCode::UNAUTHORIZED,
             Json(LoginResponse {
@@ -510,7 +531,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("创建令牌失败: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(LoginResponse {
@@ -521,6 +542,7 @@ async fn login(State(state): State<AppState>, Json(body): Json<LoginRequest>) ->
             }),
         );
     }
+    info!("用户登录成功: {} ({} 权限)", body.username, user.permission);
     (
         StatusCode::OK,
         Json(LoginResponse {
@@ -549,6 +571,7 @@ async fn list_books(
     State(state): State<AppState>,
     Query(query): Query<PageQuery>,
 ) -> impl IntoResponse {
+    debug!("查询书籍列表: page={}", query.page);
     let mut db = state.db.db().clone();
     let books = match Book::all()
         .limit(PAGE_SIZE)
@@ -558,7 +581,7 @@ async fn list_books(
     {
         Ok(b) => b,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BooksResponse {
@@ -607,11 +630,15 @@ async fn search_books(
     State(state): State<AppState>,
     Query(query): Query<SearchBooksQuery>,
 ) -> impl IntoResponse {
+    debug!(
+        "搜索书籍: title={:?}, author={:?}, category={:?}",
+        query.title, query.author, query.category
+    );
     let mut db = state.db.db().clone();
     let all_books = match Book::all().exec(&mut db).await {
         Ok(b) => b,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BooksResponse {
@@ -691,8 +718,10 @@ async fn add_book(
     Json(body): Json<AddBookRequest>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员尝试添加书籍: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!("添加书籍: title={}, author={}", body.title, body.author);
     let mut db = state.db.db().clone();
     let published_date = match &body.published_date {
         Some(d) => match parse_date(d) {
@@ -711,7 +740,7 @@ async fn add_book(
     {
         Ok(b) => b,
         Err(e) => {
-            error!("{e}");
+            error!("添加书籍失败: {e}");
             return to_error(StatusCode::INTERNAL_SERVER_ERROR, "添加书籍失败");
         }
     };
@@ -729,7 +758,7 @@ async fn add_book(
             {
                 Ok(c) => c,
                 Err(e) => {
-                    error!("{e}");
+                    error!("服务器内部错误: {e}");
                     continue;
                 }
             },
@@ -740,9 +769,10 @@ async fn add_book(
             .exec(&mut db)
             .await
         {
-            error!("{e}");
+            error!("关联分类失败: {e}");
         }
     }
+    info!("添加书籍成功: {} (id={})", book.title, book.id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -758,8 +788,10 @@ async fn delete_book(
     Path(id): Path<usize>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员尝试删除书籍: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!("删除书籍: id={}", id);
     let mut db = state.db.db().clone();
     if let Ok(book_cats) = BookCategory::filter_by_book_id(&id).exec(&mut db).await {
         for bc in book_cats {
@@ -771,9 +803,10 @@ async fn delete_book(
         _ => return to_error(StatusCode::NOT_FOUND, "书籍不存在"),
     };
     if let Err(e) = book.delete().exec(&mut db).await {
-        error!("{e}");
+        error!("删除书籍失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "删除书籍失败");
     }
+    info!("删除书籍成功: id={}", id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -786,6 +819,7 @@ async fn delete_book(
 // ==================== 用户管理 ====================
 
 async fn my_info(claims: Claims, State(state): State<AppState>) -> impl IntoResponse {
+    debug!("查询当前用户信息: user_id={}", claims.user_id);
     let mut db = state.db.db().clone();
     let borrowed_books = count_user_borrows(claims.user_id, &mut db)
         .await
@@ -797,7 +831,7 @@ async fn my_info(claims: Claims, State(state): State<AppState>) -> impl IntoResp
     {
         Ok(Some(u)) => u,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(MyInfoResponse {
@@ -836,6 +870,7 @@ async fn my_info(claims: Claims, State(state): State<AppState>) -> impl IntoResp
 
 async fn list_users(claims: Claims, State(state): State<AppState>) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(UsersResponse {
@@ -845,11 +880,12 @@ async fn list_users(claims: Claims, State(state): State<AppState>) -> impl IntoR
             }),
         );
     }
+    debug!("查询所有用户");
     let mut db = state.db.db().clone();
     let users = match User::all().exec(&mut db).await {
         Ok(u) => u,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(UsersResponse {
@@ -887,6 +923,7 @@ async fn search_users(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(UsersResponse {
@@ -896,11 +933,12 @@ async fn search_users(
             }),
         );
     }
+    debug!("搜索用户: keyword={}", id);
     let mut db = state.db.db().clone();
     let all_users = match User::all().exec(&mut db).await {
         Ok(u) => u,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(UsersResponse {
@@ -943,8 +981,10 @@ async fn delete_user(
     Path(id): Path<usize>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员尝试删除用户: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!("删除用户: id={}", id);
     let mut db = state.db.db().clone();
     let user = match User::filter_by_id(&id).first().exec(&mut db).await {
         Ok(Some(u)) => u,
@@ -956,9 +996,10 @@ async fn delete_user(
         }
     }
     if let Err(e) = user.delete().exec(&mut db).await {
-        error!("{e}");
+        error!("删除用户失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "删除用户失败");
     }
+    info!("删除用户成功: id={}", id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -976,12 +1017,25 @@ struct ChangePasswordRequest {
 async fn change_user_password(
     claims: Claims,
     State(state): State<AppState>,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
     Json(body): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
-    if !claims.is_manager() && claims.user_id != id {
+    let target_id: usize = if id == "me" {
+        claims.user_id
+    } else {
+        match id.parse() {
+            Ok(n) => n,
+            Err(_) => return to_error(StatusCode::BAD_REQUEST, "用户ID格式错误"),
+        }
+    };
+    if !claims.is_manager() && claims.user_id != target_id {
+        warn!(
+            "修改密码权限不足: operator={}, target={}",
+            claims.user_id, target_id
+        );
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!("修改密码: user_id={}", target_id);
     if !validate_password(&body.password) {
         return to_error(
             StatusCode::BAD_REQUEST,
@@ -989,7 +1043,7 @@ async fn change_user_password(
         );
     }
     let mut db = state.db.db().clone();
-    let mut user = match User::filter_by_id(&id).first().exec(&mut db).await {
+    let mut user = match User::filter_by_id(&target_id).first().exec(&mut db).await {
         Ok(Some(u)) => u,
         _ => return to_error(StatusCode::NOT_FOUND, "用户不存在"),
     };
@@ -1000,9 +1054,10 @@ async fn change_user_password(
         .expect("Argon2 error")
         .to_string();
     if let Err(e) = user.update().password(hashed_password).exec(&mut db).await {
-        error!("{e}");
+        error!("修改密码失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "修改密码失败");
     }
+    info!("修改密码成功: user_id={}", target_id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -1021,14 +1076,30 @@ struct UpdateUserRequest {
 async fn update_user_info(
     claims: Claims,
     State(state): State<AppState>,
-    Path(id): Path<usize>,
+    Path(id): Path<String>,
     Json(body): Json<UpdateUserRequest>,
 ) -> impl IntoResponse {
-    if !claims.is_manager() && claims.user_id != id {
+    let target_id: usize = if id == "me" {
+        claims.user_id
+    } else {
+        match id.parse() {
+            Ok(n) => n,
+            Err(_) => return to_error(StatusCode::BAD_REQUEST, "用户ID格式错误"),
+        }
+    };
+    if !claims.is_manager() && claims.user_id != target_id {
+        warn!(
+            "修改用户信息权限不足: operator={}, target={}",
+            claims.user_id, target_id
+        );
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!(
+        "修改用户信息: user_id={}, phone={}, email={}",
+        target_id, body.phone, body.email
+    );
     let mut db = state.db.db().clone();
-    let mut user = match User::filter_by_id(&id).first().exec(&mut db).await {
+    let mut user = match User::filter_by_id(&target_id).first().exec(&mut db).await {
         Ok(Some(u)) => u,
         _ => return to_error(StatusCode::NOT_FOUND, "用户不存在"),
     };
@@ -1039,9 +1110,10 @@ async fn update_user_info(
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("修改用户信息失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "修改用户信息失败");
     }
+    info!("修改用户信息成功: user_id={}", target_id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -1066,27 +1138,43 @@ async fn borrow_book(
     Json(body): Json<BorrowBookRequest>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员尝试借阅书籍: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!(
+        "借阅请求: book_id={}, user_id={}, expire_date={}",
+        book_id, body.user_id, body.expire_date
+    );
     let expire_date = match parse_date(&body.expire_date) {
         Ok(d) => d,
         Err(msg) => return to_error(StatusCode::BAD_REQUEST, msg),
     };
+    if expire_date <= jiff::Timestamp::now() {
+        return to_error(StatusCode::BAD_REQUEST, "到期日期必须在当前日期之后");
+    }
     let mut db = state.db.db().clone();
     let _book = match Book::filter_by_id(&book_id).first().exec(&mut db).await {
-        Ok(Some(b)) => b,
-        _ => return to_error(StatusCode::NOT_FOUND, "书籍不存在"),
+        Ok(Some(b)) => {
+            debug!("借阅: 找到书籍 \"{}\" (id={})", b.title, book_id);
+            b
+        }
+        _ => {
+            warn!("借阅失败: 书籍 {} 不存在", book_id);
+            return to_error(StatusCode::NOT_FOUND, "书籍不存在");
+        }
     };
     let records = match Record::filter_by_book_id(&book_id).exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return to_error(StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误");
         }
     };
     if records.iter().any(|r| r.return_date.is_none()) {
+        warn!("借阅失败: 书籍 {} 已被借出", book_id);
         return to_error(StatusCode::CONFLICT, "该书籍已被借出");
     }
+    debug!("借阅: 书籍可用，准备创建记录");
     let now = jiff::Timestamp::now();
     if let Err(e) = Record::create()
         .user_id(body.user_id)
@@ -1097,9 +1185,15 @@ async fn borrow_book(
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("借阅失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "借阅失败");
     }
+    info!(
+        "借阅成功: 书籍 {} -> 用户 {}, 到期 {}",
+        book_id,
+        body.user_id,
+        format_date(&expire_date)
+    );
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -1121,8 +1215,10 @@ async fn return_book(
     Json(body): Json<ReturnBookRequest>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员操作: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!("归还请求: book_id={}, user_id={}", book_id, body.user_id);
     let mut db = state.db.db().clone();
     let records = match Record::filter_by_book_id(&book_id)
         .filter_by_user_id(&body.user_id)
@@ -1131,13 +1227,19 @@ async fn return_book(
     {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return to_error(StatusCode::INTERNAL_SERVER_ERROR, "服务器内部错误");
         }
     };
     let record_id = match records.iter().find(|r| r.return_date.is_none()) {
         Some(r) => r.id,
-        None => return to_error(StatusCode::NOT_FOUND, "未找到借阅记录"),
+        None => {
+            warn!(
+                "归还失败: 书籍 {} 用户 {} 无可归还记录",
+                book_id, body.user_id
+            );
+            return to_error(StatusCode::NOT_FOUND, "未找到借阅记录");
+        }
     };
     let mut record = match Record::filter_by_id(&record_id).first().exec(&mut db).await {
         Ok(Some(r)) => r,
@@ -1149,9 +1251,10 @@ async fn return_book(
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("归还失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "归还失败");
     }
+    info!("归还成功: 书籍 {} 用户 {}", book_id, body.user_id);
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -1167,6 +1270,7 @@ async fn book_borrow_records(
     Path(book_id): Path<usize>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(BorrowRecordsResponse {
@@ -1180,7 +1284,7 @@ async fn book_borrow_records(
     let records = match Record::filter_by_book_id(&book_id).exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BorrowRecordsResponse {
@@ -1210,7 +1314,7 @@ async fn my_borrow_records(claims: Claims, State(state): State<AppState>) -> imp
     {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BorrowRecordsResponse {
@@ -1238,6 +1342,7 @@ async fn user_borrow_records(
     Path(user_id): Path<usize>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(BorrowRecordsResponse {
@@ -1251,7 +1356,7 @@ async fn user_borrow_records(
     let records = match Record::filter_by_user_id(&user_id).exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BorrowRecordsResponse {
@@ -1284,6 +1389,7 @@ async fn expired_borrow_records(
     Query(query): Query<ExpiredQuery>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(BorrowRecordsResponse {
@@ -1297,7 +1403,7 @@ async fn expired_borrow_records(
     let all_records = match Record::all().exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BorrowRecordsResponse {
@@ -1342,6 +1448,7 @@ async fn expired_borrow_records(
 
 async fn all_borrow_records(claims: Claims, State(state): State<AppState>) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("权限不足: user_id={}", claims.user_id);
         return (
             StatusCode::FORBIDDEN,
             Json(BorrowRecordsResponse {
@@ -1355,7 +1462,7 @@ async fn all_borrow_records(claims: Claims, State(state): State<AppState>) -> im
     let records = match Record::all().exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(BorrowRecordsResponse {
@@ -1390,20 +1497,58 @@ async fn submit_renewal(
     Path(record_id): Path<usize>,
     Json(body): Json<RenewRequest>,
 ) -> impl IntoResponse {
+    debug!(
+        "续借请求: record_id={}, expired_after={}",
+        record_id, body.expired_after
+    );
     let expired_after = match parse_date(&body.expired_after) {
         Ok(d) => d,
-        Err(msg) => return to_error(StatusCode::BAD_REQUEST, msg),
+        Err(msg) => {
+            warn!("续借日期格式错误: {}", body.expired_after);
+            return to_error(StatusCode::BAD_REQUEST, msg);
+        }
     };
     let mut db = state.db.db().clone();
     let record = match Record::filter_by_id(&record_id).first().exec(&mut db).await {
-        Ok(Some(r)) => r,
+        Ok(Some(r)) => {
+            debug!(
+                "续借: 找到借阅记录 id={}, expire_date={}, returned={}",
+                record_id,
+                format_date(&r.expire_date),
+                r.return_date.is_some()
+            );
+            r
+        }
         _ => return to_error(StatusCode::NOT_FOUND, "借阅记录不存在"),
     };
     if record.user_id != claims.user_id {
+        warn!(
+            "越权续借: user={} 尝试续借 record_user={}",
+            claims.user_id, record.user_id
+        );
         return to_error(StatusCode::FORBIDDEN, "只能续借自己的书籍");
     }
     if record.return_date.is_some() {
         return to_error(StatusCode::CONFLICT, "该书籍已归还");
+    }
+    let now = jiff::Timestamp::now();
+    if expired_after <= now {
+        return to_error(StatusCode::BAD_REQUEST, "续借日期必须在当前日期之后");
+    }
+    if expired_after <= record.expire_date {
+        return to_error(StatusCode::BAD_REQUEST, "续借日期必须在当前到期日期之后");
+    }
+    // 检查是否已有待审核的续借申请
+    let pending_renewals = Renew::filter_by_record_id(&record_id)
+        .exec(&mut db)
+        .await
+        .map_err(|e| error!("服务器内部错误: {e}"))
+        .unwrap_or_default();
+    if pending_renewals
+        .iter()
+        .any(|r| matches!(r.status, RenewStatus::Pending))
+    {
+        return to_error(StatusCode::CONFLICT, "该借阅记录已有待审核的续借申请");
     }
     if let Err(e) = Renew::create()
         .request_date(jiff::Timestamp::now())
@@ -1413,9 +1558,14 @@ async fn submit_renewal(
         .exec(&mut db)
         .await
     {
-        error!("{e}");
+        error!("提交续借申请失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "提交续借申请失败");
     }
+    info!(
+        "续借申请已提交: record_id={}, 新到期 {}",
+        record_id,
+        format_date(&expired_after)
+    );
     (
         StatusCode::OK,
         Json(ErrorResponse {
@@ -1426,11 +1576,12 @@ async fn submit_renewal(
 }
 
 async fn list_renewals(claims: Claims, State(state): State<AppState>) -> impl IntoResponse {
+    debug!("查询续借申请: is_manager={}", claims.is_manager());
     let mut db = state.db.db().clone();
     let all_renewals = match Renew::all().exec(&mut db).await {
         Ok(r) => r,
         Err(e) => {
-            error!("{e}");
+            error!("服务器内部错误: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(RenewalsResponse {
@@ -1514,8 +1665,13 @@ async fn approve_renewal(
     Json(body): Json<ApproveRenewalRequest>,
 ) -> impl IntoResponse {
     if !claims.is_manager() {
+        warn!("非管理员操作: user_id={}", claims.user_id);
         return to_error(StatusCode::FORBIDDEN, "权限不足");
     }
+    debug!(
+        "审批续借: renewal_id={}, approved={}",
+        renewal_id, body.approved
+    );
     let mut db = state.db.db().clone();
     let mut renewal = match Renew::filter_by_id(&renewal_id).first().exec(&mut db).await {
         Ok(Some(r)) => r,
@@ -1524,31 +1680,70 @@ async fn approve_renewal(
     if !matches!(renewal.status, RenewStatus::Pending) {
         return to_error(StatusCode::CONFLICT, "该申请已被处理");
     }
+    // 审批前检查原借阅记录是否已被归还
+    let mut record = match Record::filter_by_id(&renewal.record_id)
+        .first()
+        .exec(&mut db)
+        .await
+    {
+        Ok(Some(r)) => {
+            debug!(
+                "审批续借: 关联借阅记录 id={}, returned={}",
+                renewal.record_id,
+                r.return_date.is_some()
+            );
+            r
+        }
+        _ => return to_error(StatusCode::NOT_FOUND, "借阅记录不存在"),
+    };
+    if record.return_date.is_some() {
+        // 书籍已归还，拒绝续借
+        warn!("续借申请 {} 自动拒绝: 书籍已归还", renewal_id);
+        if let Err(e) = renewal
+            .update()
+            .status(RenewStatus::Rejected)
+            .exec(&mut db)
+            .await
+        {
+            error!("服务器内部错误: {e}");
+        }
+        return to_error(StatusCode::CONFLICT, "该书籍已归还，续借申请自动拒绝");
+    }
     let new_status = if body.approved {
         RenewStatus::Approved
     } else {
         RenewStatus::Rejected
     };
     if let Err(e) = renewal.update().status(new_status).exec(&mut db).await {
-        error!("{e}");
+        error!("审批失败: {e}");
         return to_error(StatusCode::INTERNAL_SERVER_ERROR, "审批失败");
     }
     if body.approved {
-        if let Ok(Some(mut record)) = Record::filter_by_id(&renewal.record_id)
-            .first()
+        // 归还原借阅记录
+        let now = jiff::Timestamp::now();
+        if let Err(e) = record.update().return_date(Some(now)).exec(&mut db).await {
+            error!("服务器内部错误: {e}");
+            return to_error(StatusCode::INTERNAL_SERVER_ERROR, "归还原记录失败");
+        }
+        // 创建新的借阅记录
+        if let Err(e) = Record::create()
+            .user_id(record.user_id)
+            .book_id(record.book_id)
+            .borrow_date(now)
+            .expire_date(renewal.expired_after)
+            .return_date(None)
             .exec(&mut db)
             .await
         {
-            if let Err(e) = record
-                .update()
-                .expire_date(renewal.expired_after)
-                .exec(&mut db)
-                .await
-            {
-                error!("{e}");
-                return to_error(StatusCode::INTERNAL_SERVER_ERROR, "更新到期日期失败");
-            }
+            error!("创建续借记录失败: {e}");
+            return to_error(StatusCode::INTERNAL_SERVER_ERROR, "创建续借记录失败");
         }
+        info!(
+            "续借申请通过: renewal_id={}, record_id={}",
+            renewal_id, renewal.record_id
+        );
+    } else {
+        info!("续借申请拒绝: renewal_id={}", renewal_id);
     }
     (
         StatusCode::OK,
